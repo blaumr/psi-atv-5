@@ -6,154 +6,118 @@
 
 #include <pwm_z42.h>
 
-/*
- * Atividade 5 - Sensor ultrassônico
- *
- * Trigger:
- * TPM2_CH0 -> PTB2
- *
- * Echo:
- * TPM1_CH1 -> PTB1
- *
- * Funcionamento:
- * 1. Gera um pulso de trigger.
- * 2. Mede a largura do pulso de echo usando input capture.
- * 3. Converte o tempo medido em distância.
- */
+#define TPM_DISPARO             TPM2
+#define CANAL_DISPARO           0
+#define PORTA_DISPARO           GPIOB
+#define PINO_DISPARO            2
 
-#define TRIGGER_TPM             TPM2
-#define TRIGGER_CHANNEL         0
-#define TRIGGER_PORT            GPIOB
-#define TRIGGER_PIN             2
+#define TPM_RETORNO             TPM1
+#define CANAL_RETORNO           1
+#define PORTA_RETORNO           GPIOB
+#define PINO_RETORNO            1
 
-#define ECHO_TPM                TPM1
-#define ECHO_CHANNEL            1
-#define ECHO_PORT               GPIOB
-#define ECHO_PIN                1
+#define IRQ_RETORNO             TPM1_IRQn
+#define PRIORIDADE_IRQ          1
 
-#define ECHO_IRQ_LINE           TPM1_IRQn
-#define ECHO_IRQ_PRIORITY       1
+#define MODULO_TPM_DISPARO      10000
+#define MODULO_TPM_RETORNO      65535
 
-#define TRIGGER_TPM_MODULE      10000
-#define ECHO_TPM_MODULE         65535
+#define CLOCK_TPM_HZ            48000000.0f
+#define DIVISOR_RETORNO         128.0f
 
-#define TPM_CLOCK_HZ            48000000.0f
-#define ECHO_PRESCALER          128.0f
+#define TEMPO_PULSO_US          10
+#define INTERVALO_LEITURA_MS    300
+#define TEMPO_LIMITE_MS         50
 
-#define TRIGGER_PULSE_US        10
-#define MEASUREMENT_PERIOD_MS   300
-#define ECHO_TIMEOUT_MS         50
+#define VELOCIDADE_SOM_CM_US    0.0343f
 
-#define SOUND_SPEED_CM_PER_US   0.0343f
+static volatile uint16_t borda_inicial = 0;
+static volatile uint16_t borda_final = 0;
 
-volatile uint16_t echo_rising_edge = 0;
-volatile uint16_t echo_falling_edge = 0;
+static volatile bool medida_disponivel = false;
+static volatile bool aguardando_descida = false;
 
-volatile bool echo_pulse_ready = false;
-volatile bool waiting_for_falling_edge = false;
-
-static void echo_capture_isr(void *arg)
+static void interrupcao_retorno(void *arg)
 {
     ARG_UNUSED(arg);
 
-    /*
-     * Limpa a flag de interrupção do canal 1 do TPM1.
-     */
-    TPM1->STATUS |= TPM_STATUS_CH1F_MASK;
+    TPM_RETORNO->STATUS |= TPM_STATUS_CH1F_MASK;
 
-    if (!waiting_for_falling_edge) {
-        /*
-         * Primeira borda capturada: subida do echo.
-         */
-        echo_rising_edge = TPM1->CONTROLS[ECHO_CHANNEL].CnV;
-        waiting_for_falling_edge = true;
+    if (aguardando_descida == false) {
+        borda_inicial = TPM_RETORNO->CONTROLS[CANAL_RETORNO].CnV;
+        aguardando_descida = true;
     } else {
-        /*
-         * Segunda borda capturada: descida do echo.
-         */
-        echo_falling_edge = TPM1->CONTROLS[ECHO_CHANNEL].CnV;
-        waiting_for_falling_edge = false;
-        echo_pulse_ready = true;
+        borda_final = TPM_RETORNO->CONTROLS[CANAL_RETORNO].CnV;
+        aguardando_descida = false;
+        medida_disponivel = true;
     }
 }
 
-static void init_trigger_pwm(void)
+static void preparar_saida_disparo(void)
 {
-    /*
-     * Configura o TPM2 canal 0 para gerar o sinal de trigger em PTB2.
-     */
-    pwm_tpm_Init(TRIGGER_TPM,
+    pwm_tpm_Init(TPM_DISPARO,
                  TPM_PLLFLL,
-                 TRIGGER_TPM_MODULE,
+                 MODULO_TPM_DISPARO,
                  1,
                  PS_8,
                  EDGE_PWM);
 
-    pwm_tpm_Ch_Init(TRIGGER_TPM,
-                    TRIGGER_CHANNEL,
+    pwm_tpm_Ch_Init(TPM_DISPARO,
+                    CANAL_DISPARO,
                     TPM_PWM_H,
-                    TRIGGER_PORT,
-                    TRIGGER_PIN);
+                    PORTA_DISPARO,
+                    PINO_DISPARO);
 
-    /*
-     * Mantém o trigger inicialmente em nível baixo.
-     */
-    pwm_tpm_CnV(TRIGGER_TPM, TRIGGER_CHANNEL, 0);
+    pwm_tpm_CnV(TPM_DISPARO, CANAL_DISPARO, 0);
 }
 
-static void init_echo_capture(void)
+static void preparar_entrada_retorno(void)
 {
-    /*
-     * Configura o TPM1 canal 1 para capturar o pulso de echo em PTB1.
-     * A captura é feita nas duas bordas: subida e descida.
-     */
-    pwm_tpm_Init(ECHO_TPM,
+    pwm_tpm_Init(TPM_RETORNO,
                  TPM_PLLFLL,
-                 ECHO_TPM_MODULE,
+                 MODULO_TPM_RETORNO,
                  1,
                  PS_128,
                  EDGE_PWM);
 
-    pwm_tpm_Ch_Init(ECHO_TPM,
-                    ECHO_CHANNEL,
+    pwm_tpm_Ch_Init(TPM_RETORNO,
+                    CANAL_RETORNO,
                     TPM_INPUT_CAPTURE_BOTH | TPM_CHANNEL_INTERRUPT,
-                    ECHO_PORT,
-                    ECHO_PIN);
+                    PORTA_RETORNO,
+                    PINO_RETORNO);
 
-    IRQ_CONNECT(ECHO_IRQ_LINE,
-                ECHO_IRQ_PRIORITY,
-                echo_capture_isr,
+    IRQ_CONNECT(IRQ_RETORNO,
+                PRIORIDADE_IRQ,
+                interrupcao_retorno,
                 NULL,
                 0);
 
-    irq_enable(ECHO_IRQ_LINE);
+    irq_enable(IRQ_RETORNO);
 }
 
-static void send_trigger_pulse(void)
+static void reiniciar_medida(void)
 {
-    /*
-     * Reinicia o controle de captura antes de iniciar uma nova medição.
-     */
-    echo_pulse_ready = false;
-    waiting_for_falling_edge = false;
-    echo_rising_edge = 0;
-    echo_falling_edge = 0;
-
-    /*
-     * Gera um pulso de trigger de aproximadamente 10 us.
-     */
-    pwm_tpm_CnV(TRIGGER_TPM, TRIGGER_CHANNEL, TRIGGER_TPM_MODULE / 1000);
-    k_usleep(TRIGGER_PULSE_US);
-    pwm_tpm_CnV(TRIGGER_TPM, TRIGGER_CHANNEL, 0);
+    medida_disponivel = false;
+    aguardando_descida = false;
+    borda_inicial = 0;
+    borda_final = 0;
 }
 
-static bool wait_for_echo_pulse(void)
+static void emitir_disparo(void)
 {
-    /*
-     * Aguarda até 50 ms pelo pulso de echo.
-     */
-    for (int elapsed_ms = 0; elapsed_ms < ECHO_TIMEOUT_MS; elapsed_ms++) {
-        if (echo_pulse_ready) {
+    reiniciar_medida();
+
+    pwm_tpm_CnV(TPM_DISPARO, CANAL_DISPARO, MODULO_TPM_DISPARO / 1000);
+    k_usleep(TEMPO_PULSO_US);
+    pwm_tpm_CnV(TPM_DISPARO, CANAL_DISPARO, 0);
+}
+
+static bool recebeu_resposta(void)
+{
+    int tempo_passado;
+
+    for (tempo_passado = 0; tempo_passado < TEMPO_LIMITE_MS; tempo_passado++) {
+        if (medida_disponivel) {
             return true;
         }
 
@@ -163,60 +127,46 @@ static bool wait_for_echo_pulse(void)
     return false;
 }
 
-static uint16_t calculate_pulse_ticks(void)
+static uint16_t largura_em_ticks(void)
 {
-    /*
-     * Calcula a largura do pulso em ticks.
-     * Considera também a possibilidade de overflow do contador de 16 bits.
-     */
-    if (echo_falling_edge >= echo_rising_edge) {
-        return echo_falling_edge - echo_rising_edge;
+    if (borda_final >= borda_inicial) {
+        return borda_final - borda_inicial;
     }
 
-    return (uint16_t)((ECHO_TPM_MODULE - echo_rising_edge) + echo_falling_edge + 1);
+    return (uint16_t)((MODULO_TPM_RETORNO - borda_inicial) + borda_final + 1);
 }
 
-static float ticks_to_microseconds(uint16_t ticks)
+static float converter_ticks_para_us(uint16_t ticks)
 {
-    /*
-     * tempo_tick = prescaler / clock
-     *
-     * Em microssegundos:
-     * tempo_us = ticks * prescaler * 1e6 / clock
-     */
-    return ticks * (ECHO_PRESCALER * 1000000.0f / TPM_CLOCK_HZ);
+    return ticks * ((DIVISOR_RETORNO * 1000000.0f) / CLOCK_TPM_HZ);
 }
 
-static float pulse_us_to_distance_cm(float pulse_width_us)
+static float calcular_distancia_cm(float tempo_us)
 {
-    /*
-     * O pulso de echo representa o tempo de ida e volta da onda sonora.
-     * Por isso, a distância é dividida por 2.
-     */
-    return (pulse_width_us * SOUND_SPEED_CM_PER_US) / 2.0f;
+    return (tempo_us * VELOCIDADE_SOM_CM_US) / 2.0f;
 }
 
 void main(void)
 {
-    init_trigger_pwm();
-    init_echo_capture();
+    preparar_saida_disparo();
+    preparar_entrada_retorno();
 
-    printk("Sensor ultrassonico iniciado\n");
+    printk("Modulo ultrassonico inicializado\n");
 
     while (1) {
-        send_trigger_pulse();
+        emitir_disparo();
 
-        if (wait_for_echo_pulse()) {
-            uint16_t pulse_ticks = calculate_pulse_ticks();
-            float pulse_width_us = ticks_to_microseconds(pulse_ticks);
-            float distance_cm = pulse_us_to_distance_cm(pulse_width_us);
+        if (recebeu_resposta()) {
+            uint16_t ticks = largura_em_ticks();
+            float duracao_us = converter_ticks_para_us(ticks);
+            float distancia_cm = calcular_distancia_cm(duracao_us);
 
-            printk("Largura de ticks: %u\n", pulse_ticks);
-            printk("Distancia: %.0f cm\n", distance_cm);
+            printk("Ticks medidos: %u\n", ticks);
+            printk("Distancia medida: %.0f cm\n", distancia_cm);
         } else {
-            printk("Echo nao recebido\n");
+            printk("Sem resposta do echo\n");
         }
 
-        k_msleep(MEASUREMENT_PERIOD_MS);
+        k_msleep(INTERVALO_LEITURA_MS);
     }
 }
